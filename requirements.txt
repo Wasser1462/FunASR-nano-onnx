@@ -1,0 +1,13 @@
+torch>=2.0.0
+onnxruntime>=1.15.0
+onnxruntime-gpu>=1.15.0
+transformers>=4.30.0
+funasr>=1.0.0
+numpy>=1.21.0
+librosa>=0.9.0
+kaldi_native_fbank
+soundfile
+modelscope
+onnxconverter-common
+onnx
+
