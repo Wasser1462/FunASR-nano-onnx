@@ -2,7 +2,6 @@
 
 ONNX export and inference implementation for FunASR-Nano model.
 
-
 ## Requirements
 
 - Python >= 3.8
@@ -33,8 +32,25 @@ After downloading, the `models/` directory will contain:
 - `encoder_adaptor.onnx` and `encoder_adaptor.onnx.data`
 - `llm.onnx` and `llm.onnx.data`
 - `encoder_adaptor.int8.onnx` and `llm.int8.onnx` (INT8 quantized versions)
+- `embedding.onnx` and `embedding.int8.onnx`
 
 ### 2. Run Inference
+
+**With ONNX Embedding Model (Recommended)**:
+
+```bash
+python inference.py \
+    --encoder-adaptor-model models/encoder_adaptor.onnx \
+    --llm-model models/llm.onnx \
+    --llm-tokenizer models/Qwen3-0.6B \
+    --embedding-model models/embedding.onnx \
+    --wave examples/zh.mp3 \
+    --prompt "语音转写：" \
+    --max-new-tokens 512 \
+    --device auto
+```
+
+**Without ONNX Embedding Model (requires model.safetensors)**:
 
 ```bash
 python inference.py \
@@ -49,6 +65,7 @@ python inference.py \
 
 **Parameters**:
 - `--device`: Inference device, options: `cpu`, `cuda`, or `auto` (default: `auto`, LLM uses CPU by default due to CUDA float16 issues)
+- `--embedding-model`: Path to ONNX embedding model (optional, if not provided, will use PyTorch model from `--llm-tokenizer`)
 - `--seed`: Random seed for reproducible results (default: 42)
 - `--temperature`: Sampling temperature (default: 0.3)
 - `--top-p`: Top-p (nucleus) sampling threshold (default: 0.8)
@@ -76,6 +93,26 @@ python scripts/export_llm_onnx.py \
     --opset-version 18
 ```
 
+#### Export Embedding Layer (Optional, Recommended)
+
+To avoid loading the full PyTorch model during inference, you can export the embedding layer to ONNX:
+
+```bash
+python scripts/export_embedding_onnx.py \
+    --llm-config-path /path/to/Qwen3-0.6B \
+    --output-filename models/embedding.onnx \
+    --opset-version 18 \
+    --verify
+```
+
+The `--verify` flag will automatically verify the exported model by comparing with the PyTorch model. This script will:
+1. Check if `model.safetensors` exists in the LLM config directory
+2. Export the embedding layer to ONNX format
+3. Create INT8 quantized version 
+4. Verify the exported model (if `--verify` is used)
+
+**Note**: The embedding ONNX model eliminates the need for `model.safetensors` during inference, reducing memory usage and startup time. The INT8 quantized version further reduces model size while maintaining accuracy.
+
 ## Model Description
 
 ### Encoder+Adaptor Model
@@ -91,6 +128,13 @@ python scripts/export_llm_onnx.py \
   - `attention_mask`: `(batch, sequence_length)`
 - **Output**: `logits`: `(batch, sequence_length, vocab_size)`
 - **Supports dynamic sequence length**
+
+### Embedding Model (Optional)
+
+- **Input**: `input_ids`: `(batch, sequence_length)` - Token IDs (int64)
+- **Output**: `embeddings`: `(batch, sequence_length, 1024)` - Token embeddings
+- **Supports dynamic sequence length**
+- **Purpose**: Converts token IDs to embeddings, eliminating the need for full PyTorch model during inference
 
 ### GPU Acceleration
 
