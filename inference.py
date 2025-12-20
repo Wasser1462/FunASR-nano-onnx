@@ -11,6 +11,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from scripts.llm_onnx import LLMOnnx
+from scripts.embedding_onnx import EmbeddingOnnx
 import re
 
 
@@ -144,6 +145,13 @@ def get_args():
         choices=["cpu", "cuda", "auto"],
         default="auto",
         help="Device for ONNX inference: 'cpu', 'cuda', or 'auto' (default: auto, uses CPU for LLM due to CUDA float16 issues)",
+    )
+
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default=None,
+        help="Path to ONNX embedding model (embedding.onnx). If not provided, will use PyTorch model from --llm-tokenizer",
     )
 
     return parser.parse_args()
@@ -336,25 +344,19 @@ def main():
         audio_token_len=audio_token_len,
     )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    embedding_model = AutoModelForCausalLM.from_pretrained(
-        args.llm_tokenizer,
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
-        device_map=None,
-    ).to(device)
-    embedding_layer = embedding_model.get_input_embeddings()
-    embedding_layer.eval()
-
     input_dtype = getattr(llm_model, "input_dtype", np.float32)
 
-    with torch.no_grad():
-        input_ids_tensor = torch.from_numpy(
-            source_ids_1d[None, :].astype("int64")
-        ).to(device)
-        text_embeds_torch = embedding_layer(input_ids_tensor)
-        text_embeds = text_embeds_torch.to("cpu").numpy().astype(np.float32)
+    # Initialize embedding layer (ONNX or PyTorch)
+    use_onnx_embedding = args.embedding_model is not None
+    embedding_onnx = None
+    embedding_layer = None
+    device = None
+    
+    if use_onnx_embedding:
+        # print(f"Using ONNX embedding model: {args.embedding_model}")
+        embedding_onnx = EmbeddingOnnx(args.embedding_model, device=llm_device)
+        # Get text embeddings using ONNX
+        text_embeds = embedding_onnx(source_ids_1d[None, :])
         
         if np.any(np.isnan(text_embeds)) or np.any(np.isinf(text_embeds)):
             text_embeds = np.where(np.isfinite(text_embeds), text_embeds, 0.0)
@@ -364,6 +366,33 @@ def main():
             text_embeds = text_embeds.astype(input_dtype)
         else:
             text_embeds = text_embeds.astype(input_dtype)
+    else:
+        print(f"Using PyTorch embedding model from: {args.llm_tokenizer}")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        embedding_model = AutoModelForCausalLM.from_pretrained(
+            args.llm_tokenizer,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+            device_map=None,
+        ).to(device)
+        embedding_layer = embedding_model.get_input_embeddings()
+        embedding_layer.eval()
+
+        with torch.no_grad():
+            input_ids_tensor = torch.from_numpy(
+                source_ids_1d[None, :].astype("int64")
+            ).to(device)
+            text_embeds_torch = embedding_layer(input_ids_tensor)
+            text_embeds = text_embeds_torch.to("cpu").numpy().astype(np.float32)
+            
+            if np.any(np.isnan(text_embeds)) or np.any(np.isinf(text_embeds)):
+                text_embeds = np.where(np.isfinite(text_embeds), text_embeds, 0.0)
+            
+            if input_dtype == np.float16:
+                text_embeds = np.clip(text_embeds, -65504.0, 65504.0)
+                text_embeds = text_embeds.astype(input_dtype)
+            else:
+                text_embeds = text_embeds.astype(input_dtype)
 
     if np.any(np.isnan(encoder_out)) or np.any(np.isinf(encoder_out)):
         encoder_out = np.where(np.isfinite(encoder_out), encoder_out, 0.0)
@@ -426,16 +455,21 @@ def main():
         if stop:
             break
 
-        with torch.no_grad():
-            next_token_tensor = torch.tensor(
-                [[next_token_id]], dtype=torch.long, device=device
-            )
-            next_token_embed = (
-                embedding_layer(next_token_tensor)
-                .to("cpu")
-                .numpy()
-                .astype(current_inputs_embeds.dtype)
-            )
+        # Get embedding for next token
+        if use_onnx_embedding:
+            next_token_embed = embedding_onnx([[next_token_id]])
+            next_token_embed = next_token_embed.astype(current_inputs_embeds.dtype)
+        else:
+            with torch.no_grad():
+                next_token_tensor = torch.tensor(
+                    [[next_token_id]], dtype=torch.long, device=device
+                )
+                next_token_embed = (
+                    embedding_layer(next_token_tensor)
+                    .to("cpu")
+                    .numpy()
+                    .astype(current_inputs_embeds.dtype)
+                )
 
         current_inputs_embeds = np.concatenate(
             [current_inputs_embeds, next_token_embed],

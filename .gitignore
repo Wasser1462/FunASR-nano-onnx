@@ -5,7 +5,7 @@ __pycache__/
 *.so
 .Python
 
-# ONNX models (large files, should be downloaded separately)
+
 *.onnx
 *.onnx.data
 
@@ -23,3 +23,4 @@ Thumbs.db
 *.log
 
 models/Qwen3-0.6B/model.safetensors
+models/README.md
