@@ -1,12 +1,15 @@
 mkdir -p ../models
 
+model_pt_path=/path/to/Fun-ASR-Nano-2512/model.pt
+llm_config_path=/path/to/Qwen3-0.6B
+
 python export_encoder_adaptor_onnx.py \
-    --model-pt /home/ec_user/workspace/work/test/Fun-ASR-Nano-2512/model.pt \
+    --model-pt $model_pt_path \
     --output-filename ../models/encoder_adaptor.onnx \
     --opset-version 18
 
 python export_embedding_onnx.py \
-    --llm-config-path /home/ec_user/workspace/work/test/Fun-ASR-Nano-2512/Qwen3-0.6B \
+    --llm-config-path $llm_config_path \
     --output-filename ../models/embedding.onnx \
     --opset-version 18 \
     --verify
@@ -15,8 +18,8 @@ python export_embedding_onnx.py \
 # export DEBUG_QWEN=1
 
 python export_llm_onnx.py \
-  --model-pt /home/ec_user/workspace/work/test/Fun-ASR-Nano-2512/model.pt \
-  --llm-config-path /home/ec_user/workspace/work/test/Fun-ASR-Nano-2512/Qwen3-0.6B \
+  --model-pt $model_pt_path \
+  --llm-config-path $llm_config_path \
   --output-root ../models \
   --opset-version 17 \
   --seq-len 256 \
