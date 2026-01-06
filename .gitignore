@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+
+*.onnx
+*.onnx.data
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+models/Qwen3-0.6B/model.safetensors
+models/README.md
+models/llm_fp16/
+models/llm_fp32/
+models/llm_int8/
