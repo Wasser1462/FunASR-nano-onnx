@@ -28,9 +28,15 @@ def get_args():
         help="Path to LLM config directory (e.g., Qwen3-0.6B)",
     )
     parser.add_argument(
+        "--model-pt",
+         type=str, 
+         default=None,
+        help="Path to trained checkpoint/model.pt. If set, export embedding from this checkpoint."
+    )
+    parser.add_argument(
         "--opset-version",
         type=int,
-        default=18,
+        default=17,
         help="ONNX opset version",
     )
     parser.add_argument(
@@ -80,6 +86,73 @@ def add_meta_data(filename: str, meta_data: Dict[str, Any]):
         meta.value = str(value)
     onnx.save(model, filename)
 
+def load_checkpoint_state_dict(model_pt: str) -> Dict[str, torch.Tensor]:
+    ckpt = torch.load(model_pt, map_location="cpu")
+
+    if isinstance(ckpt, dict):
+        if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            sd = ckpt["state_dict"]
+        elif "model" in ckpt and isinstance(ckpt["model"], dict):
+            sd = ckpt["model"]
+        else:
+            sd = ckpt
+    else:
+        raise RuntimeError(f"Unsupported checkpoint format: {type(ckpt)}")
+
+    fixed = {}
+    for k, v in sd.items():
+        if not torch.is_tensor(v):
+            continue
+        nk = k
+        if nk.startswith("module."):
+            nk = nk[len("module.") :]
+        fixed[nk] = v
+    return fixed
+
+
+def find_embedding_weight(
+    state_dict: Dict[str, torch.Tensor],
+    vocab_size: int = None,
+    hidden_size: int = None,
+) -> torch.Tensor:
+
+    patterns = [
+        "embed_tokens.weight",        
+        "tok_embeddings.weight", 
+        "word_embeddings.weight", 
+        "wte.weight",
+        "embeddings.word_embeddings.weight",
+    ]
+
+    candidates = []
+    for k, v in state_dict.items():
+        if not (torch.is_tensor(v) and v.ndim == 2):
+            continue
+        lk = k.lower()
+        if any(p in lk for p in patterns):
+            candidates.append((k, v))
+
+    if vocab_size is not None and hidden_size is not None:
+        for k, v in candidates:
+            if v.shape[0] == vocab_size and v.shape[1] == hidden_size:
+                return v
+        for k, v in candidates:
+            if v.shape[0] == vocab_size:
+                return v
+
+    all_2d = [(k, v) for k, v in state_dict.items() if torch.is_tensor(v) and v.ndim == 2]
+    if vocab_size is not None:
+        shape_match = [(k, v) for k, v in all_2d if v.shape[0] == vocab_size]
+        if shape_match:
+            shape_match.sort(key=lambda kv: kv[1].shape[1], reverse=True)
+            return shape_match[0][1]
+
+    if all_2d:
+        all_2d.sort(key=lambda kv: kv[1].shape[0], reverse=True)
+        return all_2d[0][1]
+
+    raise RuntimeError("No 2D tensor found in checkpoint; cannot locate embedding weight.")
+
 
 @torch.no_grad()
 def export_embedding_onnx(
@@ -123,19 +196,33 @@ def export_embedding_onnx(
 def verify_onnx_model(
     onnx_filename: str,
     llm_config_path: str,
+    model_pt: str = None,
     seq_length: int = 100,
     num_tests: int = 3,
 ):
     print("Verifying ONNX embedding model...")
-    print("Loading PyTorch model for verification...")
-    pytorch_model = AutoModelForCausalLM.from_pretrained(
-        llm_config_path,
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
-        device_map=None,
-    )
-    pytorch_embedding = pytorch_model.get_input_embeddings()
-    pytorch_embedding.eval()
+
+    if model_pt is not None:
+        print(f"Loading embedding weight from checkpoint for verification: {model_pt}")
+        config = AutoConfig.from_pretrained(llm_config_path, trust_remote_code=True)
+        vocab_size = getattr(config, "vocab_size", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        sd = load_checkpoint_state_dict(model_pt)
+        w = find_embedding_weight(sd, vocab_size=vocab_size, hidden_size=hidden_size)
+        w = w.detach().to(torch.float32).cpu()
+        pytorch_embedding = torch.nn.Embedding(w.shape[0], w.shape[1])
+        pytorch_embedding.weight.data.copy_(w)
+        pytorch_embedding.eval()
+    else:
+        print("Loading PyTorch HF model for verification (fallback)...")
+        pytorch_model = AutoModelForCausalLM.from_pretrained(
+            llm_config_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+            device_map=None,
+        )
+        pytorch_embedding = pytorch_model.get_input_embeddings()
+        pytorch_embedding.eval()
     
     print("Loading ONNX model...")
     session_opts = ort.SessionOptions()
@@ -298,7 +385,7 @@ def quantize_embedding_model(model, filename, filename_int8, original_size):
             node_idx = list(model.graph.node).index(gather_node)
             model.graph.node.insert(node_idx + 1, dequant_node)
 
-            print(f"  Quantized {initializer.name}: {initializer.dims}, saved {saved_mb:.2f}MB")
+            print(f" Quantized {initializer.name}: {initializer.dims}, saved {saved_mb:.2f}MB")
 
             try:
                 onnx.checker.check_model(model)
@@ -338,18 +425,38 @@ def main():
     vocab_size = config.vocab_size
     hidden_size = config.hidden_size
     print(f"Model config: vocab_size={vocab_size}, hidden_size={hidden_size}")
-    
-    print(f"\nLoading PyTorch model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        str(llm_config_path),
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
-        device_map=None,
-    )
-    embedding_layer = model.get_input_embeddings()
-    embedding_layer.eval()
-    embedding_layer.to("cpu")
-    
+
+    print(f"\nLoading LLM config from {llm_config_path}...")
+    config = AutoConfig.from_pretrained(str(llm_config_path), trust_remote_code=True)
+    vocab_size = getattr(config, "vocab_size", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    print(f"Model config: vocab_size={vocab_size}, hidden_size={hidden_size}")
+
+    if args.model_pt is not None:
+        print(f"\nLoading embedding weight from checkpoint: {args.model_pt}")
+        sd = load_checkpoint_state_dict(args.model_pt)
+        w = find_embedding_weight(sd, vocab_size=vocab_size, hidden_size=hidden_size)
+        w = w.detach().to(torch.float32).cpu()
+
+        print(f"Found embedding weight shape: {tuple(w.shape)}")
+        embedding_layer = torch.nn.Embedding(num_embeddings=w.shape[0], embedding_dim=w.shape[1])
+        embedding_layer.weight.data.copy_(w)
+        embedding_layer.eval()
+    else:
+        print(f"\nLoading PyTorch model from HF directory (fallback)...")
+        model = AutoModelForCausalLM.from_pretrained(
+            str(llm_config_path),
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+            device_map=None,
+        )
+        embedding_layer = model.get_input_embeddings()
+        embedding_layer.eval()
+        embedding_layer.to("cpu")
+
+    vocab_size = embedding_layer.weight.shape[0]
+    hidden_size = embedding_layer.weight.shape[1]
+    print(f"Export target: vocab_size={vocab_size}, hidden_size={hidden_size}") 
     print(f"Embedding layer: {type(embedding_layer).__name__}")
     print(f"  Weight shape: {embedding_layer.weight.shape}")
     print(f"  Num embeddings: {embedding_layer.num_embeddings}")
