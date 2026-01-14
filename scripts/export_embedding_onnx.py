@@ -502,6 +502,7 @@ def main():
         verify_onnx_model(
             onnx_filename=filename,
             llm_config_path=str(llm_config_path),
+            model_pt=args.model_pt, 
             seq_length=min(seq_length, 200),
             num_tests=5,
         )
