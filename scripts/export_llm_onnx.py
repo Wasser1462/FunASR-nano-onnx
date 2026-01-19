@@ -142,6 +142,7 @@ def set_meta_in_model(model: onnx.ModelProto, meta: Dict[str, Any]) -> None:
         p.key = str(k)
         p.value = str(v)
 
+
 # Count how many times each value is used in the model graph.
 def _all_value_uses(model: onnx.ModelProto) -> Dict[str, int]:
     uses = {}
@@ -192,6 +193,7 @@ def _remove_constant_node_output(model: onnx.ModelProto, output_name: str) -> bo
             return True
     return False
 
+
 # Remove num_outputs attribute from Split nodes (for compatibility).
 def fix_split_num_outputs(model: onnx.ModelProto) -> bool:
     modified = False
@@ -202,6 +204,7 @@ def fix_split_num_outputs(model: onnx.ModelProto) -> bool:
                     node.attribute.remove(attr)
                     modified = True
     return modified
+
 
 # Convert Reduce* ops axes input to attribute (for compatibility).
 def fix_reduce_axes_input_to_attr(model: onnx.ModelProto) -> bool:
@@ -230,11 +233,13 @@ def fix_reduce_axes_input_to_attr(model: onnx.ModelProto) -> bool:
             modified = True
     return modified
 
+
 # Apply all model fixes in place (split, reduce, IR/opset).
 def fix_model_inplace(model: onnx.ModelProto, target_ir_max: int = 9, target_opset: int = 17):
     fix_split_num_outputs(model)
     fix_reduce_axes_input_to_attr(model)
     force_ir_opset(model, target_ir_max=target_ir_max, target_opset=target_opset)
+
 
 # Patch ONNX Runtime quantization utils to use target opset version.
 def _monkeypatch_ort_get_opset_version(target_opset: int):
@@ -435,6 +440,25 @@ def infer_heads_from_model(model) -> Dict[str, int]:
 
 # Export PyTorch model to ONNX format.
 def _torch_onnx_export(wrapped, inputs, out_path: str, opset: int, input_names, output_names, dynamic_axes):
+    # Prefer dynamo exporter (better dynamic shape support), fallback to legacy exporter if it fails.
+    try:
+        torch.onnx.export(
+            wrapped,
+            inputs,
+            out_path,
+            opset_version=opset,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            do_constant_folding=True,
+            export_params=True,
+            verbose=False,
+            dynamo=True,
+        )
+        return
+    except Exception as e:
+        print("[WARN] dynamo export failed, fallback to legacy exporter:", repr(e))
+
     torch.onnx.export(
         wrapped,
         inputs,
@@ -491,7 +515,8 @@ def export_unified_llm_kv_delta(
         "inputs_embeds": {0: "batch", 1: "seq"},
         "attention_mask": {0: "batch", 1: "total_seq"},
         "cache_position": {0: "seq"},
-        "logits": {0: "batch", 1: "seq"},
+        # logits is now [B,1,V] (last token only), keep batch dynamic
+        "logits": {0: "batch"},
     }
     for i in range(num_layers):
         dynamic_axes[f"cache_key_{i}"] = {0: "batch"}
@@ -564,7 +589,9 @@ def verify_unified_kv_delta_onnx(
 
     out_prefill = sess.run(None, feed)
     logits = out_prefill[0]
-    if not (logits.shape[0] == B and logits.shape[1] == seq_len and logits.shape[-1] == vocab_size):
+
+    # logits should be [B,1,V] (last token only)
+    if not (logits.shape[0] == B and logits.shape[1] == 1 and logits.shape[-1] == vocab_size):
         raise RuntimeError(f"Prefill logits shape mismatch: {logits.shape}")
     print("Prefill OK. logits:", logits.shape)
 
@@ -591,7 +618,7 @@ def verify_unified_kv_delta_onnx(
 
     out_decode = sess.run(None, feed)
     logits2 = out_decode[0]
-    if not (logits2.shape[0] == B and logits2.shape[1] == seq_len and logits2.shape[-1] == vocab_size):
+    if not (logits2.shape[0] == B and logits2.shape[1] == 1 and logits2.shape[-1] == vocab_size):
         raise RuntimeError(f"Decode logits shape mismatch: {logits2.shape}")
     print("Decode OK. logits:", logits2.shape)
 
@@ -641,7 +668,7 @@ def main():
     fp16_dir = root_dir / "llm_fp16"
     fp32_dir = root_dir / "llm_fp32"
     int8_dir = root_dir / "llm_int8"
-    tmp_dir = root_dir / "_tmp_export_unified"
+    tmp_dir = root_dir / "_tmp_export_unified_fast"
 
     if export_fp16:
         fp16_dir.mkdir(parents=True, exist_ok=True)
@@ -678,7 +705,7 @@ def main():
         # Base metadata
         meta_base = {
             "model_type": "qwen3_causallm_unified_prefill_decode_kv_delta",
-            "version": "1",
+            "version": "2",
             "hidden_size": hidden_size,
             "vocab_size": vocab_size,
             "num_layers": num_layers,
@@ -686,6 +713,7 @@ def main():
             "io_dtype": "float32",
             "num_kv_heads": num_kv_heads,
             "head_dim": head_dim,
+            "logits_mode": "last",  # [B,1,V]
         }
 
         # FP16 (single-file)
@@ -828,5 +856,5 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(20260104)
+    torch.manual_seed(20260119)
     main()

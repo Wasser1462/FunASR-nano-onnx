@@ -3,6 +3,7 @@
 from torch import nn
 
 import adaptor
+import torch
 import torch_model
 
 
@@ -58,6 +59,7 @@ class NanoLLM(nn.Module):
         Returns:
           encoder_out: (N, T, llm_dim) - Audio features in LLM dimension
         """
+        x = x.clone()
         encoder_out = self.audio_encoder(x)
         encoder_out = self.adaptor(encoder_out)
         return encoder_out
@@ -97,24 +99,25 @@ class NanoLLM(nn.Module):
         if inputs_embeds is not None and fbank_beg is not None and fake_token_len is not None:
             batch_size = inputs_embeds.shape[0]
             speech_idx = 0
-            
+
+            fused_inputs_embeds = inputs_embeds.clone()
+
             for batch_idx in range(batch_size):
                 for turn_id in range(fbank_beg.shape[1]):
                     fbank_beg_idx = fbank_beg[batch_idx, turn_id].item()
                     if fbank_beg_idx > 0:
                         speech_token_len = fake_token_len[batch_idx, turn_id].item()
                         speech_token = encoder_out[speech_idx, :speech_token_len, :]
-                        
-                        # Fuse audio features into text embeddings
-                        inputs_embeds[
+
+                        fused_inputs_embeds[
                             batch_idx,
                             fbank_beg_idx : fbank_beg_idx + speech_token_len,
                             :,
                         ] = speech_token
-                        
+
                         speech_idx += 1
-            
-            return inputs_embeds
-        
+
+            return fused_inputs_embeds
+
         return encoder_out
 
