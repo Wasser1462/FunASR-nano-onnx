@@ -85,19 +85,6 @@ class RotaryEmbeddingFallback(nn.Module):
         return torch.cos(emb), torch.sin(emb)
 
 
-# Build key mask for attention computation.
-# Combines cache mask and chunk mask for the full key sequence.
-def _make_key_mask(attention_mask: torch.Tensor, past_len: torch.Tensor, past_len_cache: torch.Tensor, seq_len: int) -> torch.Tensor:
-    chunk_mask = attention_mask[:, -seq_len:]
-    chunk_mask = (chunk_mask > 0).to(chunk_mask.dtype)
-
-    cache_valid = (past_len > 0).to(chunk_mask.dtype)
-    B = chunk_mask.shape[0]
-    cache_mask = torch.ones((B, past_len_cache), device=chunk_mask.device, dtype=chunk_mask.dtype) * cache_valid
-
-    return torch.cat([cache_mask, chunk_mask], dim=1)
-
-
 # Unified KV delta model wrapper for Qwen3.
 # Wraps HuggingFace model to output KV deltas instead of full KV cache.
 # Supports both prefill and decode phases with a single model.
@@ -213,23 +200,36 @@ class Qwen3UnifiedKvDelta(nn.Module):
             k_kv = k_norm(k_kv)
         return q, k_kv
 
-    # Process attention chunk with KV cache.
-    # Computes attention scores using cached KV and new KV, then outputs deltas.
+    # Reference:
+    #   https://www.esperanto.ai/blog/exporting-slms-to-onnx-with-kv-cache-support
+    #
+    # Process an attention step with KV cache support.
+    # Attention scores are computed using both cached (past) KV and newly generated KV,
+    # producing only the incremental (delta) outputs for efficient decoding.
     def _attn_chunk(
         self,
         attn_mod: nn.Module,
         x: torch.Tensor,                 # [B,S,hidden]
-        attention_mask: torch.Tensor,    # [B,total_seq]
+        attention_mask: torch.Tensor,    # [B,total_seq] (keep as input for API compat; fast path assumes all-ones)
         cache_position: torch.Tensor,    # [S]
         cache_k_full: torch.Tensor,      # [B,max_total_len,kv,hd]
         cache_v_full: torch.Tensor,      # [B,max_total_len,kv,hd]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, S, _ = x.shape
+        from torch.onnx import operators as onnx_ops
 
-        past_len = cache_position[0]
-        past_len_cache = torch.clamp(past_len, min=1)
+        # keep attention_mask as a graph input (no-op), avoid exporter pruning it
+        # (fast path assumes attention_mask is all ones)
+        x = x + (attention_mask[:, :1].to(dtype=x.dtype) * 0.0)
 
-        cache_k = cache_k_full[:, :past_len_cache]     # [B,Pc,kv,hd]
+        # dynamic shapes (trace-safe)
+        x_shape = onnx_ops.shape_as_tensor(x)  # [3]
+        B = x_shape[0]
+        S = x_shape[1]
+
+        past_len = cache_position[0]                      # scalar tensor
+        past_len_cache = torch.clamp(past_len, min=1)     # scalar tensor, avoid empty cache dim
+
+        cache_k = cache_k_full[:, :past_len_cache]        # [B,Pc,kv,hd]
         cache_v = cache_v_full[:, :past_len_cache]
 
         # projections
@@ -237,10 +237,20 @@ class Qwen3UnifiedKvDelta(nn.Module):
         k = attn_mod.k_proj(x)  # [B,S,kv*hd]
         v = attn_mod.v_proj(x)  # [B,S,kv*hd]
 
-        # reshape
-        q = q.reshape(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)       # [B,H,S,hd]
-        k_kv = k.reshape(B, S, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3) # [B,kv,S,hd]
-        v_kv = v.reshape(B, S, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3) # [B,kv,S,hd]
+        # reshape (dynamic, trace-safe)
+        i64 = x_shape.dtype
+        dev = x.device
+        t_num_heads = torch.tensor(self.num_heads, device=dev, dtype=i64)
+        t_num_kv_heads = torch.tensor(self.num_kv_heads, device=dev, dtype=i64)
+        t_head_dim = torch.tensor(self.head_dim, device=dev, dtype=i64)
+
+        q = onnx_ops.reshape_from_tensor_shape(q, torch.stack([B, S, t_num_heads, t_head_dim]))
+        k_kv = onnx_ops.reshape_from_tensor_shape(k, torch.stack([B, S, t_num_kv_heads, t_head_dim]))
+        v_kv = onnx_ops.reshape_from_tensor_shape(v, torch.stack([B, S, t_num_kv_heads, t_head_dim]))
+
+        q = q.permute(0, 2, 1, 3)        # [B,H,S,hd]
+        k_kv = k_kv.permute(0, 2, 1, 3)  # [B,kv,S,hd]
+        v_kv = v_kv.permute(0, 2, 1, 3)  # [B,kv,S,hd]
 
         # QK-Norm (IMPORTANT) — do it before RoPE
         q, k_kv = self._apply_qk_norm_if_any(attn_mod, q, k_kv)
@@ -271,39 +281,34 @@ class Qwen3UnifiedKvDelta(nn.Module):
         # scores
         scores_cache = torch.matmul(q.float(), cache_k_h.float().transpose(-1, -2)) * scale  # [B,H,S,Pc]
         scores_new = torch.matmul(q.float(), k_h.float().transpose(-1, -2)) * scale          # [B,H,S,S]
-        scores = torch.cat([scores_cache, scores_new], dim=-1)                                # [B,H,S,K]
-        K = scores.shape[-1]
 
-        # padding mask
-        key_mask = _make_key_mask(attention_mask, past_len, past_len_cache, S)  # [B,K]
-        key_mask_f = (key_mask > 0).to(scores.dtype)
-        pad = (1.0 - key_mask_f).unsqueeze(1).unsqueeze(1) * 1e4
+        # cache valid gate (past_len==0 should not attend cache slot)
+        cache_valid = (past_len > 0).to(dtype=scores_cache.dtype)  # scalar 0/1
+        scores_cache = scores_cache + (1.0 - cache_valid) * (-1e4)
 
-        # causal by absolute positions
-        cache_pos = torch.arange(past_len_cache, device=cache_position.device, dtype=cache_position.dtype)
-        key_pos_total = torch.cat([cache_pos, cache_position], dim=0)  # [K]
-        q_pos = cache_position.view(S, 1)
-        k_pos = key_pos_total.view(1, K)
-        causal_ok = (k_pos <= q_pos)
-
-        causal = torch.where(
+        # causal for new tokens only: compare absolute positions from cache_position (no Shape->int, no K)
+        q_pos = cache_position.unsqueeze(1)     # [S,1]
+        k_pos = cache_position.unsqueeze(0)     # [1,S]
+        causal_ok = (k_pos <= q_pos)            # [S,S]
+        causal_new = torch.where(
             causal_ok,
-            torch.zeros((), device=scores.device, dtype=scores.dtype),
-            torch.full((), -1e4, device=scores.device, dtype=scores.dtype),
-        ).view(1, 1, S, K)
+            torch.zeros((), device=scores_new.device, dtype=scores_new.dtype),
+            torch.full((), -1e4, device=scores_new.device, dtype=scores_new.dtype),
+        ).unsqueeze(0).unsqueeze(0)             # [1,1,S,S]
+        scores_new = scores_new + causal_new
 
-        scores = scores + causal - pad
-        attn = torch.softmax(scores, dim=-1).to(q.dtype)
+        # concat cache+new scores
+        scores = torch.cat([scores_cache, scores_new], dim=-1)  # [B,H,S,Pc+S]
+        attn = torch.softmax(scores, dim=-1).to(dtype=q.dtype)
 
-        attn_cache = attn[..., :past_len_cache]
-        attn_new = attn[..., past_len_cache:]
+        # single matmul with concatenated V (avoid dynamic slice by past_len_cache)
+        v_total = torch.cat([cache_v_h, v_h], dim=2)            # [B,H,Pc+S,hd]
+        out = torch.matmul(attn, v_total)                       # [B,H,S,hd]
 
-        out_cache = torch.matmul(attn_cache, cache_v_h)  # [B,H,S,hd]
-        out_new = torch.matmul(attn_new, v_h)            # [B,H,S,hd]
-        out = out_cache + out_new
-
-        # back to hidden
-        out = out.permute(0, 2, 1, 3).reshape(B, S, self.qkv_dim)
+        # back to hidden (dynamic reshape)
+        out = out.permute(0, 2, 1, 3)                            # [B,S,H,hd]
+        t_qkv_dim = torch.tensor(self.qkv_dim, device=dev, dtype=i64)
+        out = onnx_ops.reshape_from_tensor_shape(out, torch.stack([B, S, t_qkv_dim]))
         out = attn_mod.o_proj(out)
 
         # deltas: store RoPE-applied K (IMPORTANT) and raw V
@@ -320,7 +325,7 @@ class Qwen3UnifiedKvDelta(nn.Module):
         return mlp_mod.down_proj(h)
 
     # Forward pass through the unified KV delta model.
-    # Returns logits and KV deltas for all layers.
+    # Returns logits(last token only) and KV deltas for all layers.
     def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, cache_position: torch.Tensor, *cache_flat: torch.Tensor):
         L = len(self.layers)
         if len(cache_flat) != 2 * L:
@@ -358,5 +363,8 @@ class Qwen3UnifiedKvDelta(nn.Module):
             deltas.append(v_delta.to(model_dtype))
 
         x = self.norm(x)
-        logits = self.lm_head(x).float()
+
+        # output only last token logits: [B,1,V]
+        x_last = x[:, -1:, :]
+        logits = self.lm_head(x_last).float()
         return (logits, *deltas)
