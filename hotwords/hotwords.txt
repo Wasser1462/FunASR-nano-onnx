@@ -1,0 +1,21 @@
+麦当劳
+肯德基
+北京大学
+清华大学
+人工智能
+机器学习
+长安|py=chang2 an|suffix=汽车,公司,集团
+重庆|py=chong qing|suffix=市,火锅,人,公司|allow_eos=1
+
+
+OpenAI
+ChatGPT
+TensorFlow
+PyTorch
+NumPy
+GitHub
+StackOverflow
+JavaScript
+TypeScript
+React
+
