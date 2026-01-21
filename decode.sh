@@ -1,3 +1,5 @@
+set -e
+
 echo "Decoding with INT8 models on CPU"
 python3 inference.py \
   --encoder-adaptor-model models/encoder_adaptor.int8.onnx \
@@ -61,5 +63,20 @@ python hotword_inference.py \
   --wave examples/zh.wav \
   --hotword-file hotwords/hotwords.txt \
   --rectify-file hotwords/hot-rectify.txt
+
+echo "Decoding with FP32 models on GPU (VAD)"
+python3 vad_inference.py \
+  --encoder-adaptor-model models/encoder_adaptor.onnx \
+  --embedding-model models/embedding.onnx \
+  --llm-model models/llm_fp32/llm.fp32.onnx \
+  --llm-tokenizer models/Qwen3-0.6B \
+  --wave examples/song.wav \
+  --vad-model models/silero_vad.onnx \
+  --vad-pad-sec 0.30 \
+  --vad-merge-gap-sec 0.20 \
+  --vad-min-seg-sec 0.20 \
+  --vad-max-seg-sec 20.0 \
+  --vad-split-overlap-sec 0.20
+
 
 echo "All Done!"
