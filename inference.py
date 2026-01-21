@@ -17,27 +17,13 @@ from utils import (
     sample_token,
     select_device,
     setup_tokenizer,
+    EncoderAdaptorOnnxModel,
+    bind_torch_tensor,
+    pick_last_logits_np,
+    pick_last_logits_torch,
+    np_dtype_from_ort,
+    torch_dtype_from_np,
 )
-
-
-class EncoderAdaptorOnnxModel:
-    def __init__(self, filename: str, device: str = "auto"):
-        so = ort.SessionOptions()
-        so.inter_op_num_threads = 1
-        so.intra_op_num_threads = 1
-
-        self.sess = ort.InferenceSession(filename, sess_options=so, providers=pick_providers(device))
-        meta = self.sess.get_modelmeta().custom_metadata_map
-        self.window_size = int(meta.get("lfr_window_size", 7))
-        self.window_shift = int(meta.get("lfr_window_shift", 6))
-
-        self.in_name = self.sess.get_inputs()[0].name
-        self.out_name = self.sess.get_outputs()[0].name
-
-    def __call__(self, x: np.ndarray) -> np.ndarray:
-        out = self.sess.run([self.out_name], {self.in_name: x})[0]
-        return out
-
 
 class EmbeddingOnnx:
     def __init__(self, filename: str, device: str = "cpu"):
@@ -96,80 +82,6 @@ class EmbeddingOnnx:
         self.sess.run_with_iobinding(io)
 
 
-def _np_dtype_from_ort(ort_type: str):
-    s = str(ort_type).lower()
-    if "float16" in s:
-        return np.float16
-    if "float" in s:
-        return np.float32
-    if "int64" in s:
-        return np.int64
-    raise RuntimeError(f"Unsupported ORT type: {ort_type}")
-
-
-def _torch_dtype_from_np(dt: np.dtype):
-    if dt == np.float16:
-        return torch.float16
-    if dt == np.float32:
-        return torch.float32
-    if dt == np.int64:
-        return torch.int64
-    raise RuntimeError(f"Unsupported numpy dtype: {dt}")
-
-
-def _bind_torch_tensor(io: ort.IOBinding, name: str, t: torch.Tensor, is_input: bool):
-    if not t.is_cuda:
-        raise RuntimeError(f"Tensor for '{name}' must be CUDA tensor")
-    if not t.is_contiguous():
-        t = t.contiguous()
-
-    if t.dtype == torch.float16:
-        elem = np.float16
-    elif t.dtype == torch.float32:
-        elem = np.float32
-    elif t.dtype == torch.int64:
-        elem = np.int64
-    else:
-        raise RuntimeError(f"Unsupported torch dtype for binding: {t.dtype}")
-
-    if is_input:
-        io.bind_input(
-            name=name,
-            device_type="cuda",
-            device_id=0,
-            element_type=elem,
-            shape=list(t.shape),
-            buffer_ptr=int(t.data_ptr()),
-        )
-    else:
-        io.bind_output(
-            name=name,
-            device_type="cuda",
-            device_id=0,
-            element_type=elem,
-            shape=list(t.shape),
-            buffer_ptr=int(t.data_ptr()),
-        )
-    return t
-
-
-def _pick_last_logits_np(logits: np.ndarray, prompt_len: int):
-    # Support both old ([B,S,V]) and new ([B,1,V]) export.
-    if logits.ndim != 3:
-        raise RuntimeError(f"Bad logits ndim={logits.ndim}, shape={logits.shape}")
-    if logits.shape[1] == 1:
-        return logits[0, 0, :]
-    # legacy
-    return logits[0, prompt_len - 1, :]
-
-
-def _pick_last_logits_torch(logits_t: torch.Tensor):
-    # logits is expected to be [B,1,V]
-    if logits_t.dim() != 3 or logits_t.shape[1] != 1:
-        raise RuntimeError(f"Bad logits torch shape: {tuple(logits_t.shape)}")
-    return logits_t[0, 0, :]
-
-
 class UnifiedKvDeltaLLMOnnx:
     def __init__(self, filename: str, device: str = "cpu"):
         so = ort.SessionOptions()
@@ -197,8 +109,8 @@ class UnifiedKvDeltaLLMOnnx:
         self.out_logits = outs[0].name
 
         ins = {i.name: i for i in self.sess.get_inputs()}
-        self.input_dtype = _np_dtype_from_ort(ins["inputs_embeds"].type)
-        self.cache_dtype = _np_dtype_from_ort(ins["cache_key_0"].type)
+        self.input_dtype = np_dtype_from_ort(ins["inputs_embeds"].type)
+        self.cache_dtype = np_dtype_from_ort(ins["cache_key_0"].type)
 
         if self.num_layers <= 0:
             self.num_layers = len([k for k in ins.keys() if k.startswith("cache_key_")])
@@ -214,7 +126,7 @@ class UnifiedKvDeltaLLMOnnx:
         self._io = self.sess.io_binding() if self.is_cuda else None
 
         # cache torch dtype
-        self.cache_torch_dtype = _torch_dtype_from_np(self.cache_dtype)
+        self.cache_torch_dtype = torch_dtype_from_np(self.cache_dtype)
 
     def alloc_caches(self, batch: int = 1):
         if self.max_total_len <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0:
@@ -270,19 +182,19 @@ class UnifiedKvDeltaLLMOnnx:
         io.clear_binding_inputs()
         io.clear_binding_outputs()
 
-        _bind_torch_tensor(io, self.in_inputs_embeds, inputs_embeds_t, is_input=True)
-        _bind_torch_tensor(io, self.in_attention_mask, attention_mask_t, is_input=True)
-        _bind_torch_tensor(io, self.in_cache_position, cache_position_t, is_input=True)
+        bind_torch_tensor(io, self.in_inputs_embeds, inputs_embeds_t, is_input=True)
+        bind_torch_tensor(io, self.in_attention_mask, attention_mask_t, is_input=True)
+        bind_torch_tensor(io, self.in_cache_position, cache_position_t, is_input=True)
 
         for i in range(self.num_layers):
-            _bind_torch_tensor(io, f"cache_key_{i}", caches_k_t[i], is_input=True)
-            _bind_torch_tensor(io, f"cache_value_{i}", caches_v_t[i], is_input=True)
+            bind_torch_tensor(io, f"cache_key_{i}", caches_k_t[i], is_input=True)
+            bind_torch_tensor(io, f"cache_value_{i}", caches_v_t[i], is_input=True)
 
-        _bind_torch_tensor(io, self.out_logits, logits_out_t, is_input=False)
+        bind_torch_tensor(io, self.out_logits, logits_out_t, is_input=False)
 
         for i in range(self.num_layers):
-            _bind_torch_tensor(io, f"key_delta_{i}", k_delta_out_t[i], is_input=False)
-            _bind_torch_tensor(io, f"value_delta_{i}", v_delta_out_t[i], is_input=False)
+            bind_torch_tensor(io, f"key_delta_{i}", k_delta_out_t[i], is_input=False)
+            bind_torch_tensor(io, f"value_delta_{i}", v_delta_out_t[i], is_input=False)
 
         self.sess.run_with_iobinding(io)
 
@@ -291,8 +203,6 @@ class UnifiedKvDeltaLLMOnnx:
         if not self.is_cuda:
             return self.run_cpu(inputs_embeds, attention_mask, cache_position, caches_k, caches_v)
         raise RuntimeError("Use run_cuda_iobinding for CUDA session")
-
-
 
 
 def get_args():
@@ -401,7 +311,7 @@ def main():
             caches_k[i][:, 0:prompt_len, :, :] = k_delta.astype(llm.cache_dtype, copy=False)
             caches_v[i][:, 0:prompt_len, :, :] = v_delta.astype(llm.cache_dtype, copy=False)
 
-        next_logits = _pick_last_logits_np(logits, prompt_len=prompt_len)
+        next_logits = pick_last_logits_np(logits, prompt_len=prompt_len)
         past_len = prompt_len
 
         for step in range(args.max_new_tokens):
@@ -500,7 +410,7 @@ def main():
                 return int(torch.argmax(tmp).item())
             return int(torch.argmax(logits_vec_t).item())
 
-        next_logits_t = _pick_last_logits_torch(logits_out_t)
+        next_logits_t = pick_last_logits_torch(logits_out_t)
 
         # Optional: embedding CUDA iobinding for 1-token decode
         use_emb_cuda_fast = (embedding.is_cuda and llm.is_cuda)
@@ -574,7 +484,7 @@ def main():
                 caches_v_t[i][:, past_len:past_len + 1, :, :] = v_delta_1_t[i]
 
             past_len += 1
-            next_logits_t = _pick_last_logits_torch(logits_out_t)
+            next_logits_t = pick_last_logits_torch(logits_out_t)
 
     end_time = time.time()
     processing_time = end_time - start_time
