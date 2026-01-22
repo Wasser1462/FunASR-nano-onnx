@@ -1,0 +1,9 @@
+fastapi[standard]
+pydantic
+pydantic-settings
+loguru
+soundfile
+librosa
+pydub
+uvicorn[standard]
+
