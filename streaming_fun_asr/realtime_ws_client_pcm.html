@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FunASR WebSocket Audio Transcription (Test)</title>
+    <style>
+      body {
+        user-select: none;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 18px;
+        background: #fafafa;
+      }
+      h1 { margin: 0 0 10px 0; font-size: 20px; }
+      .hint {
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: #fff7e6;
+        border: 1px solid #ffd591;
+        color: #874d00;
+        font-size: 13px;
+        margin: 10px 0 14px 0;
+        line-height: 1.4;
+      }
+      #recordButton {
+        border-radius: 12px;
+        border: 1px solid #ddd;
+        background-color: #fff;
+        padding: 10px 16px;
+        font-size: 15px;
+        cursor: pointer;
+        margin-bottom: 12px;
+        box-shadow: 0 1px 2px rgba(0,0,0,.04);
+      }
+      #recordButton.recording {
+        background-color: #ff4d4f;
+        color: #fff;
+        border-color: #ff4d4f;
+      }
+
+      .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 999px;
+        background: #fff;
+        border: 1px solid #eee;
+        font-size: 13px;
+        color: #444;
+      }
+      .dot { width: 10px; height: 10px; border-radius: 999px; background: #bbb; display: inline-block; }
+      .dot.active { background: #52c41a; }
+
+      #cards { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
+      .card {
+        background: #fff;
+        border: 1px solid #eee;
+        border-radius: 14px;
+        padding: 12px 14px;
+        box-shadow: 0 1px 2px rgba(0,0,0,.04);
+      }
+      .cardHeader { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+      .badge { font-size: 12px; padding: 4px 8px; border-radius: 999px; border: 1px solid #eee; background: #fafafa; color: #555; }
+      .badge.live { background: #e6fffb; border-color: #87e8de; color: #006d75; }
+      .time { font-size: 12px; color: #888; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .text { font-size: 16px; line-height: 1.55; white-space: pre-wrap; user-select: auto; }
+      .sub { margin-top: 8px; font-size: 12px; color: #9a9a9a; }
+
+      .footer { margin-top: 14px; font-size: 12px; color: #777; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      .btnRow { display: flex; gap: 8px; align-items: center; }
+      .smallBtn {
+        border-radius: 10px;
+        border: 1px solid #ddd;
+        background: #fff;
+        padding: 6px 10px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .smallBtn:active { transform: translateY(1px); }
+
+      #VADBox {
+        position: fixed;
+        width: 56px;
+        height: 56px;
+        border-radius: 999px;
+        box-shadow: 0 2px 10px rgba(0,0,0,.08);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        top: 16px;
+        right: 16px;
+        background-color: white;
+        border: 1px solid #eee;
+      }
+      @media screen and (max-width: 600px) {
+        #VADBox { top: unset; bottom: 10px; right: calc(50% - 28px); }
+      }
+      #MicrophoneWait { display: block; }
+      #MicrophoneListen { display: none; }
+    </style>
+  </head>
+
+  <body>
+    <h1>FunASR 流式语音识别（WebSocket / PCM16）</h1>
+
+    <div class="hint">
+      提示：此页面仅用于测试代码，不保证稳定性和识别效果。
+    </div>
+
+    <div class="row">
+      <button id="recordButton">开始识别</button>
+
+      <div class="pill">
+        <span id="vadDot" class="dot"></span>
+        <span>VAD：</span>
+        <span id="vadText" class="mono" style="color:#aaa">idle</span>
+      </div>
+
+      <div class="pill">
+        <span>WS：</span>
+        <span id="wsText" class="mono" style="color:#aaa">closed</span>
+      </div>
+
+      <div class="btnRow">
+        <button class="smallBtn" id="btnClear">清空结果</button>
+      </div>
+    </div>
+
+    <div id="cards"></div>
+
+    <div id="VADBox" title="VAD 状态">
+      <svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" width="30" height="30" id="MicrophoneWait">
+        <path d="M393.846154 301.948718m-301.948718 0a301.948718 301.948718 0 1 0 603.897436 0 301.948718 301.948718 0 1 0-603.897436 0Z" fill="#8CF6FB"></path>
+        <path d="M932.102564 420.102564c0 216.615385-165.415385 397.784615-380.717949 418.789744l-65.641025 1.31282C263.876923 825.764103 91.897436 641.969231 91.897436 420.102564v-13.128205-6.564103C91.897436 382.030769 106.338462 367.589744 124.717949 367.589744S157.538462 382.030769 157.538462 400.410256V420.102564c0 195.610256 158.851282 354.461538 354.461538 354.461539s354.461538-158.851282 354.461538-354.461539v-13.128205-6.564103c0-18.379487 14.441026-32.820513 32.820513-32.820512s32.820513 14.441026 32.820513 32.820512V420.102564zM512 708.923077c-160.164103 0-288.820513-128.65641-288.820513-288.820513V288.820513C223.179487 128.65641 351.835897 0 512 0s288.820513 128.65641 288.820513 288.820513v131.282051c0 160.164103-128.65641 288.820513-288.820513 288.820513z m223.179487-420.102564c0-123.405128-99.774359-223.179487-223.179487-223.179487s-223.179487 99.774359-223.179487 223.179487v131.282051c0 123.405128 99.774359 223.179487 223.179487 223.179487s223.179487-99.774359 223.179487-223.179487V288.820513z" fill="#3C2DCB"></path>
+      </svg>
+      <svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" width="30" height="30" id="MicrophoneListen">
+        <path d="M393.846154 301.948718m-301.948718 0a301.948718 301.948718 0 1 0 603.897436 0 301.948718 301.948718 0 1 0-603.897436 0Z" fill="#f9ba1c"></path>
+        <path d="M932.102564 420.102564c0 216.615385-165.415385 397.784615-380.717949 418.789744l-65.641025 1.31282C263.876923 825.764103 91.897436 641.969231 91.897436 420.102564v-13.128205-6.564103C91.897436 382.030769 106.338462 367.589744 124.717949 367.589744S157.538462 382.030769 157.538462 400.410256V420.102564c0 195.610256 158.851282 354.461538 354.461538 354.461539s354.461538-158.851282 354.461538-354.461539v-13.128205-6.564103c0-18.379487 14.441026-32.820513 32.820513-32.820512s32.820513 14.441026 32.820513 32.820512V420.102564zM512 708.923077c-160.164103 0-288.820513-128.65641-288.820513-288.820513V288.820513C223.179487 128.65641 351.835897 0 512 0s288.820513 128.65641 288.820513 288.820513v131.282051c0 160.164103-128.65641 288.820513-288.820513 288.820513z m223.179487-420.102564c0-123.405128-99.774359-223.179487-223.179487-223.179487s-223.179487 99.774359-223.179487 223.179487v131.282051c0 123.405128 99.774359 223.179487 223.179487 223.179487s223.179487-99.774359 223.179487-223.179487V288.820513z" fill="#f95945"></path>
+      </svg>
+    </div>
+
+    <div class="footer">
+      <div class="mono" style="color:#999">
+        音频：浏览器 getUserMedia → float32 → PCM16LE（16kHz/mono）→ WebSocket
+      </div>
+    </div>
+  </body>
+
+  <script>
+    const recordButton = document.getElementById("recordButton");
+    const cardsEl = document.getElementById("cards");
+    const vadDot = document.getElementById("vadDot");
+    const vadText = document.getElementById("vadText");
+    const wsText = document.getElementById("wsText");
+    const btnClear = document.getElementById("btnClear");
+
+    let ws = null;
+    let isRecording = false;
+
+    // WebAudio
+    let audioCtx = null;
+    let mediaStream = null;
+    let sourceNode = null;
+    let processorNode = null;
+
+    // 采样/发送配置
+    const TARGET_SR = 16000;
+    const SEND_MS = 100;                 // 100ms 一包
+    const SAMPLES_PER_PACKET = TARGET_SR * SEND_MS / 1000; // 1600
+
+    // 用于重采样/打包
+    let resampleBuf = []; // float32 缓冲
+    let downsampleRatio = 1;
+
+    const ui = {
+      setWS(state){
+        wsText.textContent = state;
+        wsText.style.color = (state === "open") ? "#006d75" : "#aaa";
+      },
+      setVAD(active){
+        vadDot.classList.toggle("active", !!active);
+        vadText.textContent = active ? "active" : "idle";
+        vadText.style.color = active ? "#006d75" : "#aaa";
+        document.getElementById("MicrophoneWait").style.display = active ? "none" : "block";
+        document.getElementById("MicrophoneListen").style.display = active ? "block" : "none";
+      },
+    };
+    ui.setWS("closed");
+    ui.setVAD(false);
+
+    const state = {
+      sentences: new Map(), // id -> {id, begin_at, end_at, text, is_final}
+      activeId: null
+    };
+
+    function fmtTime(t){
+      if (t === null || t === undefined) return "Now";
+      return Number(t).toFixed(2);
+    }
+    function ensureSentence(id){
+      if (!state.sentences.has(id)){
+        state.sentences.set(id, { id, begin_at: 0, end_at: null, text: "", is_final: false });
+      }
+      return state.sentences.get(id);
+    }
+    function render(){
+      const items = Array.from(state.sentences.values()).sort((a,b)=>a.id-b.id);
+      cardsEl.innerHTML = "";
+      for (const s of items){
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const header = document.createElement("div");
+        header.className = "cardHeader";
+
+        const badge = document.createElement("div");
+        badge.className = "badge" + (s.is_final ? "" : " live");
+        badge.textContent = s.is_final ? `#${s.id} FINAL` : `#${s.id} LIVE`;
+
+        const time = document.createElement("div");
+        time.className = "time mono";
+        time.textContent = `${fmtTime(s.begin_at)} ~ ${fmtTime(s.end_at)}`;
+
+        header.appendChild(badge);
+        header.appendChild(time);
+
+        const text = document.createElement("div");
+        text.className = "text";
+        text.textContent = s.text || "";
+
+        const sub = document.createElement("div");
+        sub.className = "sub mono";
+        sub.textContent = s.is_final ? "VAD 段结束" : "实时更新中";
+
+        card.appendChild(header);
+        card.appendChild(text);
+        card.appendChild(sub);
+        cardsEl.appendChild(card);
+      }
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    }
+    function resetAll(){
+      state.sentences.clear();
+      state.activeId = null;
+      render();
+    }
+    btnClear.onclick = () => resetAll();
+
+    recordButton.onclick = () => {
+      if (!isRecording) start();
+      else stop();
+    };
+
+    function wsSend(u8){
+      if (!u8 || u8.length === 0) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+    }
+
+    function floatToPCM16(float32){
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++){
+        let s = Math.max(-1, Math.min(1, float32[i]));
+        out[i] = (s < 0 ? s * 32768 : s * 32767) | 0;
+      }
+      return new Uint8Array(out.buffer);
+    }
+
+    // 简单下采样（平均抽取法），仅用作测试
+    function downsampleTo16k(input, inSampleRate){
+      if (inSampleRate === TARGET_SR) return input;
+      const ratio = inSampleRate / TARGET_SR;
+      const newLen = Math.floor(input.length / ratio);
+      const out = new Float32Array(newLen);
+      let offset = 0;
+      for (let i = 0; i < newLen; i++){
+        const start = Math.floor(i * ratio);
+        const end = Math.floor((i + 1) * ratio);
+        let sum = 0, count = 0;
+        for (let j = start; j < end && j < input.length; j++){
+          sum += input[j];
+          count++;
+        }
+        out[i] = count ? (sum / count) : input[start] || 0;
+        offset = end;
+      }
+      return out;
+    }
+
+    async function start(){
+      resetAll();
+
+      // 1) WS
+      ws = new WebSocket(`ws://${window.location.host}/api/realtime/ws`);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = async () => {
+        ui.setWS("open");
+        recordButton.textContent = "停止识别";
+        recordButton.classList.add("recording");
+        isRecording = true;
+
+        // 2) Mic
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            }
+          });
+        } catch (e) {
+          alert("获取麦克风失败（请检查浏览器权限/是否 https 或 localhost）：" + e);
+          ws.close();
+          return;
+        }
+
+        // 3) WebAudio
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+
+        // 用 ScriptProcessor（兼容性强）
+        processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+
+        const inSR = audioCtx.sampleRate;
+        console.log("AudioContext sampleRate=", inSR);
+
+        processorNode.onaudioprocess = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          const input = e.inputBuffer.getChannelData(0); // Float32Array
+          const ds0 = downsampleTo16k(input, inSR);
+          const GAIN = 4.0;
+
+          for (let i = 0; i < ds0.length; i++) {
+            let v = ds0[i] * GAIN;
+            if (v > 1) v = 1;
+            if (v < -1) v = -1;
+            resampleBuf.push(v);
+}
+          while (resampleBuf.length >= SAMPLES_PER_PACKET){
+            const frame = new Float32Array(SAMPLES_PER_PACKET);
+            for (let i = 0; i < SAMPLES_PER_PACKET; i++){
+              frame[i] = resampleBuf[i];
+            }
+            resampleBuf = resampleBuf.slice(SAMPLES_PER_PACKET);
+
+            const u8 = floatToPCM16(frame);
+            wsSend(u8);
+          }
+        };
+
+        // 必须连接到 destination 才会触发 onaudioprocess（但把音量输出设为0避免回放）
+        const gain = audioCtx.createGain();
+        gain.gain.value = 0;
+        sourceNode.connect(processorNode);
+        processorNode.connect(gain);
+        gain.connect(audioCtx.destination);
+      };
+
+      ws.onmessage = (evt) => {
+        let j = null;
+        try { j = JSON.parse(evt.data); } catch(e){ return; }
+
+        if (j.type === "VADEvent"){
+          ui.setVAD(!!j.is_active);
+          return;
+        }
+
+        if (j.type === "TranscriptionResponse"){
+          const id = j.id;
+          const isFinal = !!j.is_final || (j.end_at !== null && j.end_at !== undefined);
+          const text = (j.data && (j.data.final_text || j.data.raw_text)) || "";
+
+          const s = ensureSentence(id);
+          if (j.begin_at !== null && j.begin_at !== undefined) s.begin_at = j.begin_at;
+          if (j.end_at !== null && j.end_at !== undefined) s.end_at = j.end_at;
+
+          if (!isFinal){
+            state.activeId = id;
+            s.is_final = false;
+            if (text) s.text = text;
+            render();
+            return;
+          }
+
+          // final：结束，不覆盖历史，只把该句标 final
+          s.is_final = true;
+          s.text = text || s.text;
+          render();
+          if (state.activeId === id) state.activeId = null;
+          return;
+        }
+      };
+
+      ws.onclose = () => {
+        ui.setWS("closed");
+        ui.setVAD(false);
+        cleanupAudio();
+        recordButton.textContent = "开始识别";
+        recordButton.classList.remove("recording");
+        isRecording = false;
+      };
+
+      ws.onerror = () => {
+        try { ws && ws.close(); } catch(e){}
+      };
+    }
+
+    function cleanupAudio(){
+      try { if (processorNode) processorNode.disconnect(); } catch(e){}
+      try { if (sourceNode) sourceNode.disconnect(); } catch(e){}
+      try { if (audioCtx) audioCtx.close(); } catch(e){}
+      audioCtx = null;
+      processorNode = null;
+      sourceNode = null;
+
+      if (mediaStream){
+        try {
+          mediaStream.getTracks().forEach(t => t.stop());
+        } catch(e){}
+      }
+      mediaStream = null;
+      resampleBuf = [];
+    }
+
+    function stop(){
+      try { if (ws) ws.close(); } catch(e){}
+    }
+  </script>
+</html>
