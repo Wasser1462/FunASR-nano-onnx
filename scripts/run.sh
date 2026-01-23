@@ -28,6 +28,22 @@ python export_llm_onnx.py \
   --past-len 256 \
   --verify
 
+# NOTE:
+# Some AVX2-only CPU environments may produce incorrect / unstable outputs with the original INT8 LLM
+# (e.g., repeated tokens or garbled text) due to specific ORT INT8 kernel paths.
+# This exporter generates AVX2-safe INT8 compatibility variants (llm_int8_compat) that have been
+# validated in Colab, so users on AVX2-only machines can replace llm_int8/llm.int8.onnx with a compat one.
+#
+# python export_llm_onnx_u8u8.py \
+#   --model-pt $model_pt_path \
+#   --llm-config-path $llm_config_path \
+#   --output-root ../models \
+#   --opset-version 17 \
+#   --seq-len 256 \
+#   --past-len 256 \
+#   --verify
+
+
 bash fix_all_models.sh
 
 rm -rf ../models/*.backup
