@@ -9,8 +9,8 @@ Python ≥ 3.8; install deps from `requirements.txt`.
 
 ## Export (only if you need to re-export from model.pt)
 1. Edit `scripts/run.sh` and set your paths:  
-   - `model_pt_path=/path/to/Fun-ASR-Nano-2512/model.pt`  
-   - `llm_config_path=/path/to/Qwen3-0.6B`
+   - `fun_asr_path=/path/to/Fun-ASR-Nano-2512`  
+
 2. Run:
    ```bash
    cd scripts
@@ -26,6 +26,14 @@ With downloaded or exported models, run:
 bash decode.sh
 ```
 `decode.sh` is a minimal demo, using INT8/FP32 models for quick sanity check.
+
+## Streaming ASR (WebSocket Server)
+Run the real-time streaming ASR server:
+```bash
+cd streaming_fun_asr
+python realtime_ws_server.py
+```
+Supports INT8 models (CPU) and FP32 models (CUDA), auto-detected. Open `http://localhost:8000` for the demo page.
 
 ## C++ inference
 See detailed C++ examples in sherpa-onnx: <https://github.com/k2-fsa/sherpa-onnx>

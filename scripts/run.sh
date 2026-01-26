@@ -1,7 +1,8 @@
 mkdir -p ../models
 
-model_pt_path=/path/to/Fun-ASR-Nano-2512/model.pt
-llm_config_path=/path/to/Fun-ASR-Nano-2512/Qwen3-0.6B
+fun_asr_path=/path/to/Fun-ASR-Nano-2512
+model_pt_path=$fun_asr_path/model.pt
+llm_config_path=$fun_asr_path/Qwen3-0.6B
 
 python export_encoder_adaptor_onnx.py \
     --model-pt $model_pt_path \
@@ -43,7 +44,14 @@ python export_llm_onnx.py \
 #   --past-len 256 \
 #   --verify
 
-
+# Fix ONNX models for compatibility with ONNX Runtime
+# The exported models use opset 18+ features and incompatible operator formats.
+# This script applies the following fixes to ensure compatibility:
+#   1. Remove 'num_outputs' attribute from Split ops (not needed in opset 13+)
+#   2. Convert Reduce ops' axes input to attribute (required for opset 17 compatibility)
+#   3. Convert Pad ops' axes input from opset 18 format to opset 17 format
+#   4. Force IR version <= 9 and opset version = 17 for maximum compatibility
+# These fixes ensure the models work correctly with ONNX Runtime across different versions.
 bash fix_all_models.sh
 
 rm -rf ../models/*.backup

@@ -226,9 +226,9 @@ class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=Tr
     PORT: int = Field(8000)
     DEBUG: bool = Field(False)
 
-    ENCODER_ADAPTOR_MODEL: str = Field(os.path.join(_default_models_dir, "encoder_adaptor.onnx"))
-    EMBEDDING_MODEL: str = Field(os.path.join(_default_models_dir, "embedding.onnx"))
-    LLM_MODEL: str = Field(os.path.join(_default_models_dir, "llm_fp32", "llm.fp32.onnx"))
+    ENCODER_ADAPTOR_MODEL: str = Field(os.path.join(_default_models_dir, "encoder_adaptor.int8.onnx"))
+    EMBEDDING_MODEL: str = Field(os.path.join(_default_models_dir, "embedding.int8.onnx"))
+    LLM_MODEL: str = Field(os.path.join(_default_models_dir, "llm_int8", "llm.int8.onnx"))
     LLM_TOKENIZER: str = Field(os.path.join(_default_models_dir, "Qwen3-0.6B"))
 
     VAD_MODEL: str = Field(os.path.join(_default_models_dir, "silero_vad.onnx"))
@@ -283,6 +283,10 @@ CORE_LOCK: Optional[asyncio.Lock] = None
 @app.on_event("startup")
 async def startup_event():
     global GLOBAL_CORE, GLOBAL_VAD_CORE, CORE_LOCK
+    # Determine runtime based on device and model path
+    # If device is cpu or model is int8, use cpu runtime
+    runtime = "cpu" if config.DEVICE == "cpu" or "int8" in config.LLM_MODEL.lower() else "auto"
+    
     core_cfg = StreamingConfig(
         encoder_adaptor_model=config.ENCODER_ADAPTOR_MODEL,
         embedding_model=config.EMBEDDING_MODEL,
@@ -291,6 +295,7 @@ async def startup_event():
         encoder_device=config.DEVICE,
         embedding_device=config.DEVICE,
         llm_device=config.DEVICE,
+        runtime=runtime,  # Explicitly set runtime to avoid auto-detection issues
         sample_rate=config.SAMPLERATE,
         prompt_zh_streaming=config.PROMPT_ZH_STREAMING,
         prompt_zh_offline=config.PROMPT_ZH_OFFLINE,
@@ -358,18 +363,50 @@ async def websocket_endpoint(ws: WebSocket):
     begin_at = 0.0
     in_speech = False
     last_text = ""
+    first_result_sent_for_current_speech = False  # Track if first result has been sent for current speech segment
 
     async def handle_speech_audio(speech_f32: np.ndarray, is_last: bool, s0: int, s1: int):
-        nonlocal last_text, speech_id, in_speech, begin_at
+        nonlocal last_text, speech_id, in_speech, begin_at, first_result_sent_for_current_speech
         if speech_f32.size == 0 and not is_last:
             return
         speech_i16 = np.clip(speech_f32 * 32768.0, -32768, 32767).astype(np.int16)
 
+        # Collect all results during streaming
+        collected_results = []
+        
         async with CORE_LOCK:
             for res in session_asr.streaming_inference(speech_i16, is_last=bool(is_last)):
-                text = res.get("text", "") or ""
-                delta = res.get("delta", "") or ""
-                final_text = res.get("final_text", None)
+                collected_results.append(res)
+
+        if collected_results:
+            # Send first result immediately (only once per speech segment) to show first character
+            if not first_result_sent_for_current_speech:
+                first_res = collected_results[0]
+                text = first_res.get("text", "") or ""
+                if text:  # Only send if there's actual text
+                    first_result_sent_for_current_speech = True
+                    resp = TranscriptionResponse(
+                        id=speech_id,
+                        begin_at=begin_at,
+                        end_at=None,
+                        data=TranscriptionChunk(
+                            timestamps=first_res.get("timestamps", []),
+                            raw_text=text,
+                            final_text=None,
+                            delta=text,
+                        ),
+                        is_final=False,  # Not final yet
+                        session_id=session_id,
+                    )
+                    await ws.send_json(resp.model_dump())
+            
+            # Only send final result when VAD ends (is_last=True) to avoid UI flickering
+            # This ensures complete sentences are displayed together
+            if is_last:
+                final_res = collected_results[-1]
+                text = final_res.get("text", "") or ""
+                delta = final_res.get("delta", "") or ""
+                final_text = final_res.get("final_text", None)
 
                 display = final_text or text
                 if display:
@@ -380,15 +417,17 @@ async def websocket_endpoint(ws: WebSocket):
                     begin_at=begin_at,
                     end_at=None,
                     data=TranscriptionChunk(
-                        timestamps=res.get("timestamps", []),
+                        timestamps=final_res.get("timestamps", []),
                         raw_text=display,
                         final_text=final_text,
                         delta=delta,
                     ),
-                    is_final=bool(is_last and (final_text is not None)),
+                    is_final=True,  # Always final when VAD ends
                     session_id=session_id,
                 )
                 await ws.send_json(resp.model_dump())
+                # Reset flag for next speech segment
+                first_result_sent_for_current_speech = False
 
         if is_last:
             end_at = float(s1) / config.SAMPLERATE
@@ -440,8 +479,10 @@ async def websocket_endpoint(ws: WebSocket):
 
             audio_max = int(np.abs(samples_i16).max())
             audio_mean = float(np.abs(samples_i16).mean())
-            if audio_max < 200:
-                logger.warning(f"Audio seems too small or wrong format: max={audio_max}, mean={audio_mean:.1f}")
+            # Only warn if audio is suspiciously small (likely silence or wrong format)
+            # Normal audio can have max < 200, so we use a lower threshold and check both max and mean
+            if audio_max < 50 and audio_mean < 10:
+                logger.debug(f"Audio seems very quiet: max={audio_max}, mean={audio_mean:.1f}")
 
             samples_f32 = samples_i16.astype(np.float32) / 32768.0
             audio_buf = np.concatenate([audio_buf, samples_f32], axis=0)
@@ -456,6 +497,7 @@ async def websocket_endpoint(ws: WebSocket):
                         session_asr.reset()
                         begin_at = float(speech_dict["start"]) / config.SAMPLERATE
                         in_speech = True
+                        first_result_sent_for_current_speech = False  # Reset flag for new speech segment
                         await ws.send_json(VADEvent(is_active=True).model_dump())
 
                     if in_speech or speech_f32.size > 0:

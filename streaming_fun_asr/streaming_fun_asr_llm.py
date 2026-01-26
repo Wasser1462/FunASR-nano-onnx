@@ -13,6 +13,27 @@ import torch
 from transformers import AutoTokenizer
 
 
+CPU_INTRA_THREADS = 4
+CPU_INTER_THREADS = 1
+
+def make_session_options(device: str, enable_cpu_arena: bool = True, enable_mem_pattern: bool = False):
+    so = ort.SessionOptions()
+
+    if device == "auto":
+        device = "cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+
+    if device == "cpu":
+        so.intra_op_num_threads = int(CPU_INTRA_THREADS)
+        so.inter_op_num_threads = int(CPU_INTER_THREADS)
+    else:
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+
+    so.enable_cpu_mem_arena = bool(enable_cpu_arena)
+    so.enable_mem_pattern = bool(enable_mem_pattern)
+    return so
+
+
 def pick_providers(device: str):
     providers = ort.get_available_providers()
     if device == "cpu":
@@ -157,6 +178,12 @@ def np_dtype_from_ort(ort_type: str):
         return np.float32
     if "int64" in s:
         return np.int64
+    if "int32" in s:
+        return np.int32
+    if "int8" in s:
+        return np.int8
+    if "uint8" in s:
+        return np.uint8
     raise RuntimeError(f"Unsupported ORT type: {ort_type}")
 
 
@@ -167,6 +194,12 @@ def torch_dtype_from_np(np_dtype: np.dtype):
         return torch.float32
     if np_dtype == np.int64:
         return torch.int64
+    if np_dtype == np.int32:
+        return torch.int32
+    if np_dtype == np.int8:
+        return torch.int8
+    if np_dtype == np.uint8:
+        return torch.uint8
     raise RuntimeError(f"Unsupported numpy dtype: {np_dtype}")
 
 
@@ -182,6 +215,12 @@ def bind_torch_tensor(io: ort.IOBinding, name: str, t: torch.Tensor, is_input: b
         elem = np.float32
     elif t.dtype == torch.int64:
         elem = np.int64
+    elif t.dtype == torch.int32:
+        elem = np.int32
+    elif t.dtype == torch.int8:
+        elem = np.int8
+    elif t.dtype == torch.uint8:
+        elem = np.uint8
     else:
         raise RuntimeError(f"Unsupported torch dtype for binding: {t.dtype}")
 
@@ -250,9 +289,7 @@ def build_source_ids(tokenizer: AutoTokenizer, system_prompt: str, user_prompt: 
 
 class EncoderAdaptorOnnxModel:
     def __init__(self, filename: str, device: str = "auto"):
-        so = ort.SessionOptions()
-        so.inter_op_num_threads = 1
-        so.intra_op_num_threads = 1
+        so = make_session_options(device, enable_cpu_arena=True, enable_mem_pattern=False)
         self.sess = ort.InferenceSession(filename, sess_options=so, providers=pick_providers(device))
         meta = self.sess.get_modelmeta().custom_metadata_map
         self.window_size = int(meta.get("lfr_window_size", 7))
@@ -266,9 +303,7 @@ class EncoderAdaptorOnnxModel:
 
 class EmbeddingOnnx:
     def __init__(self, filename: str, device: str = "cpu"):
-        so = ort.SessionOptions()
-        so.inter_op_num_threads = 1
-        so.intra_op_num_threads = 1
+        so = make_session_options(device, enable_cpu_arena=True, enable_mem_pattern=False)
         self.sess = ort.InferenceSession(filename, sess_options=so, providers=pick_providers(device))
         self.in_name = self.sess.get_inputs()[0].name
         self.out_name = self.sess.get_outputs()[0].name
@@ -308,6 +343,108 @@ class EmbeddingOnnx:
             buffer_ptr=int(out_t.data_ptr()),
         )
         self.sess.run_with_iobinding(io)
+
+
+class UnifiedKvDeltaLLMOnnxCPU:
+    # CPU (int8) version: uses numpy sess.run(), outputs key_delta/value_delta for KV update.
+    def __init__(self, filename: str, device: str = "cpu"):
+        so = make_session_options(device, enable_cpu_arena=True, enable_mem_pattern=False)
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.sess = ort.InferenceSession(filename, sess_options=so, providers=pick_providers(device))
+        meta = self.sess.get_modelmeta().custom_metadata_map
+
+        self.quant_type = str(meta.get("quantization_type", ""))
+        self.num_layers = int(meta.get("num_layers", 0) or 0)
+        self.max_total_len = int(meta.get("max_total_len", 0) or 0)
+        self.num_kv_heads = int(meta.get("num_kv_heads", 0) or 0)
+        self.head_dim = int(meta.get("head_dim", 0) or 0)
+
+        ins = {i.name: i for i in self.sess.get_inputs()}
+        outs = [o.name for o in self.sess.get_outputs()]
+        self.outs = outs
+
+        self.in_inputs_embeds = "inputs_embeds"
+        self.in_attention_mask = "attention_mask"
+        self.in_cache_position = "cache_position"
+
+        if self.in_inputs_embeds not in ins:
+            raise RuntimeError(f"LLM missing input '{self.in_inputs_embeds}'. got={list(ins.keys())}")
+        if self.in_attention_mask not in ins:
+            raise RuntimeError(f"LLM missing input '{self.in_attention_mask}'. got={list(ins.keys())}")
+        if self.in_cache_position not in ins:
+            raise RuntimeError(f"LLM missing input '{self.in_cache_position}'. got={list(ins.keys())}")
+
+        self.input_dtype = np_dtype_from_ort(ins[self.in_inputs_embeds].type)
+
+        cache0 = ins.get("cache_key_0", None)
+        if cache0 is None:
+            raise RuntimeError("LLM missing cache_key_0 input; not a kv-cache model?")
+        self.cache_dtype = np_dtype_from_ort(cache0.type)
+
+        if self.num_layers <= 0:
+            self.num_layers = len([k for k in ins.keys() if k.startswith("cache_key_")])
+
+        # logits output is usually first
+        self.out_logits = self.sess.get_outputs()[0].name
+
+        # discover delta outputs
+        self.key_delta_names = [n for n in outs if n.startswith("key_delta_")]
+        self.val_delta_names = [n for n in outs if n.startswith("value_delta_")]
+
+        if len(self.key_delta_names) != self.num_layers or len(self.val_delta_names) != self.num_layers:
+            raise RuntimeError(
+                "Cannot find expected key_delta_/value_delta_ outputs. "
+                f"num_layers={self.num_layers}, found key_delta={len(self.key_delta_names)}, value_delta={len(self.val_delta_names)}. "
+                f"outputs={outs}"
+            )
+
+        def _layer_idx(n: str) -> int:
+            try:
+                return int(n.split("_")[-1])
+            except Exception:
+                return 0
+
+        self.key_delta_names.sort(key=_layer_idx)
+        self.val_delta_names.sort(key=_layer_idx)
+
+    def alloc_caches(self, batch: int = 1):
+        if self.max_total_len <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0:
+            raise RuntimeError(
+                f"Missing meta for cache alloc: max_total_len={self.max_total_len}, "
+                f"num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}"
+            )
+        caches_k = []
+        caches_v = []
+        for _ in range(self.num_layers):
+            caches_k.append(np.zeros((batch, self.max_total_len, self.num_kv_heads, self.head_dim), dtype=self.cache_dtype))
+            caches_v.append(np.zeros((batch, self.max_total_len, self.num_kv_heads, self.head_dim), dtype=self.cache_dtype))
+        return caches_k, caches_v
+
+    def run(
+        self,
+        inputs_embeds: np.ndarray,         # [1, S, H]
+        attention_mask: np.ndarray,        # [1, S_total]
+        cache_position: np.ndarray,        # [S] or [1] depending on prefill/decode
+        caches_k: List[np.ndarray],
+        caches_v: List[np.ndarray],
+    ):
+        feed = {
+            self.in_inputs_embeds: np.ascontiguousarray(inputs_embeds, dtype=self.input_dtype),
+            self.in_attention_mask: np.ascontiguousarray(attention_mask, dtype=np.int64),
+            self.in_cache_position: np.ascontiguousarray(cache_position, dtype=np.int64),
+        }
+        for i in range(self.num_layers):
+            feed[f"cache_key_{i}"] = np.ascontiguousarray(caches_k[i], dtype=self.cache_dtype)
+            feed[f"cache_value_{i}"] = np.ascontiguousarray(caches_v[i], dtype=self.cache_dtype)
+        return self.sess.run(None, feed)
+
+    def parse_outputs(self, outs_list: List[np.ndarray]):
+        name2arr = {self.sess.get_outputs()[i].name: outs_list[i] for i in range(len(outs_list))}
+        logits = name2arr[self.out_logits]
+        k_d = [name2arr[n] for n in self.key_delta_names]
+        v_d = [name2arr[n] for n in self.val_delta_names]
+        return logits, k_d, v_d
 
 
 # LLM model with KV cache delta updates, using CUDA iobinding for efficiency.
@@ -417,32 +554,65 @@ class UnifiedKvDeltaLLMOnnxCUDA:
         self.sess.run_with_iobinding(io)
 
 
+# runtime:
+#   - "auto":  if CUDA EP available -> "mixed", else -> "cpu"
+#   - "cpu":   encoder/embedding/llm all on cpu, llm prefers int8 model
+#   - "gpu":   encoder/embedding/llm all on gpu, llm uses fp32 model
+#   - "mixed": llm on gpu(fp32), encoder+embedding on cpu(prefer int8)
+#   - "custom": respect encoder_device/embedding_device/llm_device, and choose model paths accordingly
 @dataclass
 class StreamingConfig:
     encoder_adaptor_model: str
     embedding_model: str
     llm_model: str
     llm_tokenizer: str
+
+    # Optional int8 model paths for CPU / mixed mode.
+    # If not set, falls back to encoder_adaptor_model / embedding_model / llm_model.
+    encoder_adaptor_model_int8: Optional[str] = None
+    embedding_model_int8: Optional[str] = None
+    llm_model_int8: Optional[str] = None
+
+    runtime: str = "auto"
+
     encoder_device: str = "auto"
     embedding_device: str = "auto"
     llm_device: str = "auto"
+
     sample_rate: int = 16000
     prompt_zh_streaming: str = "流式语音转写："
     prompt_zh_offline: str = "语音转写："
     system_prompt: str = "You are a helpful assistant."
+
     temperature: float = 0.0
     top_p: float = 1.0
     max_new_tokens_per_chunk: int = 96
     seed: int = 42
+
     stable_drop_last_token: bool = True
     warmup_ms: int = 1200
     pending_chars: int = 16
     min_commit_chars: int = 6
     min_commit_audio_ms: int = 2500
     audio_window_ms: int = 6000
+
     final_decode_on_end: bool = True
     final_max_new_tokens: int = 256
+
     ban_step0_strings: Tuple[str, ...] = ("A", "a", "�")
+
+
+def _has_cuda_ep():
+    return "CUDAExecutionProvider" in ort.get_available_providers()
+
+
+def _resolve_runtime(cfg: StreamingConfig) -> str:
+    m = str(cfg.runtime or "auto").lower()
+    if m == "auto":
+        return "mixed" if _has_cuda_ep() else "cpu"
+    if m in ("cpu", "gpu", "mixed", "custom"):
+        return m
+    return "mixed" if _has_cuda_ep() else "cpu"
 
 
 class FunASRCore:
@@ -450,12 +620,54 @@ class FunASRCore:
         self.cfg = cfg
         self.tokenizer, self.eos_token_id, self.im_end_token_id = setup_tokenizer(cfg.llm_tokenizer)
 
-        self.enc_dev = select_device(cfg.encoder_device)
-        self.emb_dev = select_device(cfg.embedding_device)
-        self.llm_dev = select_device(cfg.llm_device, model_path=cfg.llm_model)
+        runtime = _resolve_runtime(cfg)
+        self.runtime = runtime
 
-        if "int8" in cfg.llm_model.lower():
-            raise RuntimeError("CUDA streaming core requires fp32/fp16 LLM model, not int8.")
+        # Pick model paths by runtime policy.
+        # cpu/mixed prefer int8 paths if provided.
+        if runtime in ("cpu", "mixed"):
+            enc_path = cfg.encoder_adaptor_model_int8 or cfg.encoder_adaptor_model
+            emb_path = cfg.embedding_model_int8 or cfg.embedding_model
+        else:
+            enc_path = cfg.encoder_adaptor_model
+            emb_path = cfg.embedding_model
+
+        if runtime == "cpu":
+            llm_path = cfg.llm_model_int8 or cfg.llm_model
+        else:
+            llm_path = cfg.llm_model
+
+        # Determine devices.
+        # mixed: force encoder/embedding cpu, llm cuda.
+        if runtime == "cpu":
+            self.enc_dev = "cpu"
+            self.emb_dev = "cpu"
+            self.llm_dev = "cpu"
+        elif runtime == "gpu":
+            self.enc_dev = select_device(cfg.encoder_device, enc_path)
+            self.emb_dev = select_device(cfg.embedding_device, emb_path)
+            self.llm_dev = "cuda" if _has_cuda_ep() else "cpu"
+        elif runtime == "mixed":
+            self.enc_dev = "cpu"
+            self.emb_dev = "cpu"
+            self.llm_dev = "cuda" if _has_cuda_ep() else "cpu"
+        else:
+            # custom: respect per-component device and choose int8 model on cpu if available
+            self.enc_dev = select_device(cfg.encoder_device, enc_path)
+            self.emb_dev = select_device(cfg.embedding_device, emb_path)
+            self.llm_dev = select_device(cfg.llm_device, llm_path)
+
+            if self.enc_dev == "cpu":
+                enc_path = cfg.encoder_adaptor_model_int8 or enc_path
+            if self.emb_dev == "cpu":
+                emb_path = cfg.embedding_model_int8 or emb_path
+            if self.llm_dev == "cpu":
+                llm_path = cfg.llm_model_int8 or llm_path
+
+        # CPU uses int8 model by default (recommended).
+        # GPU uses fp32 model; do NOT run int8 LLM on CUDA iobinding path.
+        if self.llm_dev == "cuda" and "int8" in llm_path.lower():
+            raise RuntimeError(f"LLM cuda mode requires fp32 model, got int8 path: {llm_path}")
 
         if cfg.seed is not None:
             np.random.seed(cfg.seed)
@@ -463,15 +675,8 @@ class FunASRCore:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(cfg.seed)
 
-        self.encoder = EncoderAdaptorOnnxModel(cfg.encoder_adaptor_model, device=self.enc_dev)
-        self.embedding = EmbeddingOnnx(cfg.embedding_model, device=self.emb_dev)
-
-        if self.llm_dev != "cuda":
-            self.llm_dev = "cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
-        if self.llm_dev != "cuda":
-            raise RuntimeError("CUDAExecutionProvider not available; cannot use CUDA iobinding LLM.")
-
-        self.llm = UnifiedKvDeltaLLMOnnxCUDA(cfg.llm_model, device="cuda")
+        self.encoder = EncoderAdaptorOnnxModel(enc_path, device=self.enc_dev)
+        self.embedding = EmbeddingOnnx(emb_path, device=self.emb_dev)
 
         self._ban_step0_ids: List[int] = []
         for s in cfg.ban_step0_strings:
@@ -483,11 +688,21 @@ class FunASRCore:
             raise RuntimeError("Embedding output dim must be static to run fast CUDA path.")
         self.hidden_size = int(self.embedding.embed_dim)
 
+        # LLM instance selected by llm_dev.
+        self.llm_is_cuda = (self.llm_dev == "cuda")
+        if self.llm_is_cuda:
+            self.llm = UnifiedKvDeltaLLMOnnxCUDA(llm_path, device="cuda")
+        else:
+            self.llm = UnifiedKvDeltaLLMOnnxCPU(llm_path, device="cpu")
+
 
 class FunASRSession:
     def __init__(self, core: FunASRCore):
         self.core = core
-        self._alloc_cuda_buffers()
+        if self.core.llm_is_cuda:
+            self._alloc_cuda_buffers()
+        else:
+            self._alloc_cpu_buffers()
         self.reset()
 
     def _alloc_cuda_buffers(self):
@@ -508,17 +723,31 @@ class FunASRSession:
             self._tok_id_t = None
             self._tok_embed_t = None
 
+    def _alloc_cpu_buffers(self):
+        llm = self.core.llm
+        self._caches_k_np, self._caches_v_np = llm.alloc_caches(batch=1)
+        self._attn_mask_buf_np = np.ones((1, llm.max_total_len), dtype=np.int64)
+
     def reset(self):
         self._all_samples = np.zeros((0,), dtype=np.float32)
         self.committed_text = ""
         self.pending_text = ""
         self.prev_text = ""
         self._last_emit_text = ""
+        if self.core.llm_is_cuda:
+            self._llm_clear_kv_cuda()
+        else:
+            self._llm_clear_kv_cpu()
 
-    def _llm_clear_kv(self):
+    def _llm_clear_kv_cuda(self):
         for i in range(self.core.llm.num_layers):
             self._caches_k_t[i].zero_()
             self._caches_v_t[i].zero_()
+
+    def _llm_clear_kv_cpu(self):
+        for i in range(self.core.llm.num_layers):
+            self._caches_k_np[i].fill(0)
+            self._caches_v_np[i].fill(0)
 
     def _ensure_prefill_deltas(self, seq: int):
         if self._prefill_seq_cached == seq and self._k_delta_prefill_t is not None and self._v_delta_prefill_t is not None:
@@ -550,8 +779,10 @@ class FunASRSession:
         if not text:
             return ""
         toks = self.core.tokenizer.encode(text)
+        # Don't drop the last token if there's only 1 token (preserve first character)
+        # Only drop last token when there are 2+ tokens to avoid losing the first character
         if len(toks) <= 1:
-            return ""
+            return text  # Return original text instead of empty string
         return self.core.tokenizer.decode(toks[:-1]).replace("�", "")
 
     def _decode_clean(self, ids: List[int]) -> str:
@@ -628,11 +859,12 @@ class FunASRSession:
 
     # Prefill: seq = context_len, mask_len = context_len.
     # Apply KV deltas to cache buffer in-place.
-    def _prefill(self, inputs_embeds_np: np.ndarray, prompt_len: int):
+    def _prefill_cuda(self, inputs_embeds_np: np.ndarray, prompt_len: int):
         llm = self.core.llm
-        self._llm_clear_kv()
+        self._llm_clear_kv_cuda()
         self._ensure_prefill_deltas(prompt_len)
 
+        # fp32 model on CUDA, keep float32 inputs for iobinding
         inputs_embeds_t = torch.from_numpy(inputs_embeds_np).to(device="cuda", dtype=torch.float32, non_blocking=False).contiguous()
         attn = self._attn_mask_buf[:, :prompt_len].contiguous()
         cache_pos = torch.arange(0, prompt_len, device="cuda", dtype=torch.int64).contiguous()
@@ -650,16 +882,37 @@ class FunASRSession:
         torch.cuda.synchronize()
 
         # Apply KV deltas to cache buffer in-place.
-        # kv_outputs contains deltas that update cache_kv at positions specified by cache_position.
         for i in range(llm.num_layers):
             self._caches_k_t[i][:, 0:prompt_len, :, :] = self._k_delta_prefill_t[i]
             self._caches_v_t[i][:, 0:prompt_len, :, :] = self._v_delta_prefill_t[i]
 
         return prompt_len
 
+    def _prefill_cpu(self, inputs_embeds_np: np.ndarray, prompt_len: int):
+        llm = self.core.llm
+        self._llm_clear_kv_cpu()
+
+        attn = self._attn_mask_buf_np[:, :prompt_len]
+        cache_pos = np.arange(0, prompt_len, dtype=np.int64)
+
+        outs = llm.run(
+            inputs_embeds=inputs_embeds_np,
+            attention_mask=attn,
+            cache_position=cache_pos,
+            caches_k=self._caches_k_np,
+            caches_v=self._caches_v_np,
+        )
+        logits, k_d, v_d = llm.parse_outputs(outs)
+
+        for i in range(llm.num_layers):
+            self._caches_k_np[i][:, 0:prompt_len, :, :] = k_d[i]
+            self._caches_v_np[i][:, 0:prompt_len, :, :] = v_d[i]
+
+        return prompt_len, logits
+
     # Decode: seq = 1, mask_len = valid_len (= past + 1).
-    # Performs token generation in a loop, using CUDA iobinding for efficiency.
-    def _decode_steps(self, past_len: int, max_new_tokens: int) -> List[int]:
+    # Performs token generation in a loop.
+    def _decode_steps_cuda(self, past_len: int, max_new_tokens: int) -> List[int]:
         llm = self.core.llm
         generated: List[int] = []
         next_logits_t = pick_last_logits_torch(self._logits_out_t)
@@ -712,7 +965,6 @@ class FunASRSession:
                 tok_embed = self.core.embedding(np.array([[tok]], dtype=np.int64)).astype(np.float32, copy=False)
                 inputs_embeds_step_t = torch.from_numpy(np.ascontiguousarray(tok_embed)).to(device="cuda", dtype=torch.float32, non_blocking=False).contiguous()
 
-            # mask_len must equal kv_seq_len (= past + current).
             total_seq = cur_len + 1
             attn = self._attn_mask_buf[:, :total_seq].contiguous()
             cache_pos = torch.tensor([cur_len], device="cuda", dtype=torch.int64).contiguous()
@@ -729,13 +981,68 @@ class FunASRSession:
             )
             torch.cuda.synchronize()
 
-            # Apply KV deltas to cache buffer in-place.
             for i in range(llm.num_layers):
                 self._caches_k_t[i][:, cur_len:cur_len + 1, :, :] = self._k_delta_1_t[i]
                 self._caches_v_t[i][:, cur_len:cur_len + 1, :, :] = self._v_delta_1_t[i]
 
             cur_len += 1
             next_logits_t = pick_last_logits_torch(self._logits_out_t)
+
+        return generated
+
+    def _decode_steps_cpu(self, past_len: int, logits_prefill: np.ndarray, max_new_tokens: int) -> List[int]:
+        llm = self.core.llm
+        generated: List[int] = []
+
+        # logits_prefill: [1, S, V] or [1, 1, V]
+        if logits_prefill.ndim != 3:
+            raise RuntimeError(f"Bad logits shape: {tuple(logits_prefill.shape)}")
+        next_logits = logits_prefill[0, -1, :].astype(np.float32, copy=False)
+
+        cur_len = int(past_len)
+        for step in range(max_new_tokens):
+            if llm.max_total_len > 0 and cur_len >= llm.max_total_len:
+                break
+
+            tok = sample_token(
+                next_logits,
+                temperature=self.core.cfg.temperature,
+                top_p=self.core.cfg.top_p,
+                eos_token_id=self.core.eos_token_id,
+                im_end_token_id=self.core.im_end_token_id,
+                ban_token_ids_step0=self.core._ban_step0_ids,
+                step=step,
+            )
+            generated.append(tok)
+
+            if step > 0:
+                if self.core.eos_token_id is not None and tok == self.core.eos_token_id:
+                    break
+                if self.core.im_end_token_id is not None and tok == self.core.im_end_token_id:
+                    break
+
+            tok_embed = self.core.embedding(np.array([[tok]], dtype=np.int64)).astype(np.float32, copy=False)
+            tok_embed = np.ascontiguousarray(tok_embed, dtype=llm.input_dtype)
+
+            total_seq = cur_len + 1
+            attn = self._attn_mask_buf_np[:, :total_seq]
+            cache_pos = np.array([cur_len], dtype=np.int64)
+
+            outs = llm.run(
+                inputs_embeds=tok_embed,
+                attention_mask=attn,
+                cache_position=cache_pos,
+                caches_k=self._caches_k_np,
+                caches_v=self._caches_v_np,
+            )
+            logits, k_d, v_d = llm.parse_outputs(outs)
+
+            for i in range(llm.num_layers):
+                self._caches_k_np[i][:, cur_len:cur_len + 1, :, :] = k_d[i]
+                self._caches_v_np[i][:, cur_len:cur_len + 1, :, :] = v_d[i]
+
+            cur_len += 1
+            next_logits = logits[0, -1, :].astype(np.float32, copy=False)
 
         return generated
 
@@ -753,8 +1060,12 @@ class FunASRSession:
             prev_text_for_prompt=prev_for_prompt,
         )
 
-        past_len = self._prefill(inputs_embeds_np, prompt_len)
-        ids = self._decode_steps(past_len, self.core.cfg.max_new_tokens_per_chunk)
+        if self.core.llm_is_cuda:
+            past_len = self._prefill_cuda(inputs_embeds_np, prompt_len)
+            ids = self._decode_steps_cuda(past_len, self.core.cfg.max_new_tokens_per_chunk)
+        else:
+            past_len, logits0 = self._prefill_cpu(inputs_embeds_np, prompt_len)
+            ids = self._decode_steps_cpu(past_len, logits0, self.core.cfg.max_new_tokens_per_chunk)
 
         new_text = self._decode_clean(ids)
         full_text = (prev_for_prompt + new_text).strip()
@@ -767,8 +1078,14 @@ class FunASRSession:
                 streaming=False,
                 prev_text_for_prompt="",
             )
-            past_len2 = self._prefill(inputs_embeds2, prompt_len2)
-            ids2 = self._decode_steps(past_len2, self.core.cfg.final_max_new_tokens)
+
+            if self.core.llm_is_cuda:
+                past_len2 = self._prefill_cuda(inputs_embeds2, prompt_len2)
+                ids2 = self._decode_steps_cuda(past_len2, self.core.cfg.final_max_new_tokens)
+            else:
+                past_len2, logits2 = self._prefill_cpu(inputs_embeds2, prompt_len2)
+                ids2 = self._decode_steps_cpu(past_len2, logits2, self.core.cfg.final_max_new_tokens)
+
             final2 = self._decode_clean(ids2).strip()
             if final2:
                 final_text_offline = final2
@@ -803,16 +1120,33 @@ class FunASRSession:
             return
 
         # Implement commit/pending logic for stable output.
+        # Special handling for first chunk: always show at least the first character
+        is_first_chunk = (not self.committed_text and not self.pending_text)
+        
         if len(self._all_samples) < int(self.core.cfg.sample_rate * self.core.cfg.min_commit_audio_ms / 1000) and not is_last:
-            self.committed_text = ""
-            self.pending_text = full_text
+            # Audio duration is too short, but for first chunk, ensure first character is shown
+            if is_first_chunk and full_text:
+                # For first chunk, commit at least first character to ensure it's displayed
+                self.committed_text = full_text[0] if len(full_text) > 0 else ""
+                self.pending_text = full_text[1:] if len(full_text) > 1 else ""
+            else:
+                self.committed_text = ""
+                self.pending_text = full_text
         else:
             old_total = (self.committed_text + self.pending_text).strip()
             lcp = self._lcp_len(old_total, full_text)
             base = full_text[:lcp]
             commit_part, _ = self._split_commit_pending(base)
+            
+            # For first chunk, ensure at least first character is committed if text is short
+            if is_first_chunk and full_text and len(commit_part) == 0 and len(full_text) <= self.core.cfg.pending_chars:
+                # If first chunk and no commit part, commit at least first character
+                commit_part = full_text[0] if len(full_text) > 0 else ""
+                tail = full_text[1:] if len(full_text) > 1 else ""
+            else:
+                tail = full_text[len(commit_part):]
+            
             self.committed_text = commit_part
-            tail = full_text[len(commit_part):]
             if len(tail) > self.core.cfg.pending_chars:
                 tail = tail[-self.core.cfg.pending_chars:]
             self.pending_text = tail
