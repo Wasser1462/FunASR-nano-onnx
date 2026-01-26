@@ -25,20 +25,26 @@ def main():
     parser.add_argument(
         "--encoder-adaptor-model",
         type=str,
-        default=os.path.join(_default_models_dir, "encoder_adaptor.onnx"),
+        default=os.path.join(_default_models_dir, "encoder_adaptor.int8.onnx"),
         help="Encoder adaptor model path"
     )
     parser.add_argument(
         "--embedding-model",
         type=str,
-        default=os.path.join(_default_models_dir, "embedding.onnx"),
+        default=os.path.join(_default_models_dir, "embedding.int8.onnx"),
         help="Embedding model path"
     )
     parser.add_argument(
         "--llm-model",
         type=str,
-        default=os.path.join(_default_models_dir, "llm_fp32", "llm.fp32.onnx"),
-        help="LLM model path"
+        default=os.path.join(_default_models_dir, "llm_int8", "llm.int8.onnx"),
+        help="LLM model path (int8 for CPU)"
+    )
+    parser.add_argument(
+        "--llm-model-int8",
+        type=str,
+        default=None,
+        help="LLM int8 model path (optional, falls back to --llm-model if not set)"
     )
     parser.add_argument(
         "--llm-tokenizer",
@@ -57,13 +63,6 @@ def main():
         type=int,
         default=1200,
         help="Warmup duration in milliseconds (wait before outputting results)"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        choices=["cpu", "cuda"],
-        help="Device to use (default: cuda for FP32 models)"
     )
     parser.add_argument(
         "--prompt",
@@ -93,8 +92,10 @@ def main():
     print(f"Encoder model: {args.encoder_adaptor_model}")
     print(f"Embedding model: {args.embedding_model}")
     print(f"LLM model: {args.llm_model}")
+    if args.llm_model_int8:
+        print(f"LLM int8 model: {args.llm_model_int8}")
     print(f"Tokenizer: {args.llm_tokenizer}")
-    print(f"Device: {args.device}")
+    print(f"Device: CPU")
     print(f"Hop size: {args.hop_ms}ms")
     print(f"Warmup: {args.warmup_ms}ms")
     print("=" * 80)
@@ -104,9 +105,13 @@ def main():
         embedding_model=args.embedding_model,
         llm_model=args.llm_model,
         llm_tokenizer=args.llm_tokenizer,
-        encoder_device=args.device,
-        embedding_device=args.device,
-        llm_device=args.device,
+        encoder_adaptor_model_int8=args.encoder_adaptor_model,
+        embedding_model_int8=args.embedding_model,
+        llm_model_int8=args.llm_model_int8 or args.llm_model,
+        runtime="cpu",
+        encoder_device="cpu",
+        embedding_device="cpu",
+        llm_device="cpu",
         sample_rate=16000,
         prompt_zh_streaming=args.prompt,
         prompt_zh_offline="语音转写：",
