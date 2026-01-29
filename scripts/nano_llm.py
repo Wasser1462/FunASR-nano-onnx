@@ -1,3 +1,4 @@
+# script/nano_llm.py
 #!/usr/bin/env python3
 
 from torch import nn

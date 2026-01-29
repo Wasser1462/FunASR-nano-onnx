@@ -64,6 +64,18 @@ python hotword_inference.py \
   --hotword-file hotwords/hotwords.txt \
   --rectify-file hotwords/hot-rectify.txt
 
+echo "Decoding with INT8 models on CPU (hotword version 2)"
+python3 hotword_inference_2.py \
+  --encoder-adaptor-model models/encoder_adaptor.int8.onnx \
+  --embedding-model models/embedding.int8.onnx \
+  --llm-model models/llm_int8/llm.int8.onnx \
+  --llm-tokenizer models/Qwen3-0.6B \
+  --wave examples/zh.wav \
+  --language 中文 \
+  --hotwords "开放时间,早上酒店" \
+  --no-itn
+
+
 echo "Decoding with FP32 models on GPU (VAD)"
 python3 vad_inference.py \
   --encoder-adaptor-model models/encoder_adaptor.onnx \
