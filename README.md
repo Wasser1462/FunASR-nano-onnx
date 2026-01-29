@@ -31,6 +31,8 @@ bash decode.sh
 Run the real-time streaming ASR server:
 ```bash
 cd streaming_fun_asr
+```
+```bash
 python realtime_ws_server.py
 ```
 Supports INT8 models (CPU) and FP32 models (CUDA), auto-detected. Open `http://localhost:8000` for the demo page.
